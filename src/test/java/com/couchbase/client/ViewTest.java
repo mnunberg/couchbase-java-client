@@ -56,6 +56,7 @@ import java.util.logging.Logger;
 import net.spy.memcached.PersistTo;
 import net.spy.memcached.ReplicateTo;
 import net.spy.memcached.TestConfig;
+import net.spy.memcached.internal.OperationFuture;
 import net.spy.memcached.ops.OperationStatus;
 
 import org.apache.http.HttpResponse;
@@ -118,7 +119,7 @@ public class ViewTest {
   public static void before() throws Exception {
     BucketTool bucketTool = new BucketTool();
     bucketTool.deleteAllBuckets();
-    bucketTool.createDefaultBucket(BucketType.COUCHBASE, 256, 0);
+    bucketTool.createDefaultBucket(BucketType.COUCHBASE, 256, 1);
 
     BucketTool.FunctionCallback callback = new FunctionCallback() {
       @Override
@@ -179,7 +180,7 @@ public class ViewTest {
     client.shutdown();
     System.out.println("Setup of design docs complete, "
             + "sleeping until they propogate.");
-    Thread.sleep(5000);
+    Thread.sleep(10000);
   }
 
   @Before
@@ -750,12 +751,76 @@ public class ViewTest {
   @Test
   public void testObserveWithStaleFalse()
     throws InterruptedException, ExecutionException {
-    int docAmount = 500;
-    for (int i = 1; i <= docAmount; i++) {
-      String value = "{\"type\":\"observetest\",\"value\":"+i+"}";
-      client.set("observetest"+i, 0, value, PersistTo.MASTER, ReplicateTo.ONE);
+    int expectAmount = 0;
+    
+    class OpCounter {
+      public int numRemaining = 0;
+      public int numSuccess = 0;
+      
+      public OpCounter(int initVal) {
+        numRemaining = initVal;
+      }
+      
+      public synchronized void submitResult(OperationStatus status) {
+        if (status.isSuccess()) {
+          numSuccess++;
+          return;
+        }
+        System.err.printf("Couldn't submit op: %s\n", status.getMessage());
+      }
+      
+      public synchronized int getKeySuffix() {
+        numRemaining--;
+        return numRemaining;
+      }
+      
+    };
+    
+    class KeySetter extends Thread {
+      private final OpCounter opCounter;
+      public KeySetter(OpCounter oc) {
+        opCounter = oc;
+      }
+      
+      @Override
+      public void run() {
+        while (true) {
+          
+          int id = opCounter.getKeySuffix();
+          if (id < 0) {
+            System.out.println("Done enqueuing operations");
+            break;
+          }
+          
+          String key = "observetest" + id;
+          String value = "{\"type\":\"observetest\",\"value\":"+id+"}";
+          OperationFuture<Boolean> ft = client.set(
+              key, 0, value, PersistTo.MASTER, ReplicateTo.ONE);
+          opCounter.submitResult(ft.getStatus());
+        }
+      }
     }
-
+    
+    int workerCount = 1;
+    OpCounter globOc = new OpCounter(500);
+    KeySetter[] setters = new KeySetter[workerCount];
+    
+    for (int i = 0; i < workerCount; i++) {
+      setters[i] = new KeySetter(globOc);
+      setters[i].start();
+    }
+    
+    System.out.printf("Waiting for %d threads to finish..\n", workerCount);
+    
+    // Now wait for them to complete..
+    for (int i = 0; i < workerCount; i++) {
+      setters[i].join();
+    }
+    expectAmount = globOc.numSuccess;
+    
+    assert expectAmount > 0 : "Not enough successes..";
+    System.out.printf("Have %d keys to wait for..\n", expectAmount);
+    
     Query query = new Query().setStale(Stale.FALSE);
     View view = client.getView(DESIGN_DOC_OBSERVE, VIEW_NAME_OBSERVE);
 
@@ -771,7 +836,8 @@ public class ViewTest {
       returnedRows.add(row);
     }
 
-    assertEquals(docAmount, returnedRows.size());
+    assertEquals(expectAmount, returnedRows.size());
+    System.out.println("Done!\n");
   }
 
   /**
